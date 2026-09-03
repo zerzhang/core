@@ -1,39 +1,50 @@
 """Config flow for Switchbot."""
 
 import logging
-from typing import Any
+from time import monotonic
+from typing import Any, Literal
 
+from aiohttp import RequestInfo
+from multidict import CIMultiDict, CIMultiDictProxy
 from switchbot import (
+    OAUTH_AUTHORIZE_URL,
+    OAUTH_TOKEN_URL,
     SwitchbotAccountConnectionError,
     SwitchBotAdvertisement,
     SwitchbotApiError,
     SwitchbotAuthenticationError,
     SwitchbotModel,
+    build_oauth_authorize_url,
+    exchange_oauth_code,
     fetch_cloud_devices,
+    fetch_cloud_devices_by_token,
     parse_advertisement_data,
 )
 import voluptuous as vol
+from yarl import URL
 
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import (
-    ConfigEntry,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult, OptionsFlow
 from homeassistant.const import (
+    CONF_ACCESS_TOKEN,
     CONF_ADDRESS,
     CONF_PASSWORD,
     CONF_SENSOR_TYPE,
+    CONF_TOKEN,
     CONF_USERNAME,
 )
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow
-from homeassistant.helpers import selector
+from homeassistant.exceptions import (
+    OAuth2TokenRequestReauthError,
+    OAuth2TokenRequestTransientError,
+)
+from homeassistant.helpers import config_entry_oauth2_flow, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.config_entry_oauth2_flow import MY_AUTH_CALLBACK_PATH
 
 from .const import (
     CONF_CURTAIN_SPEED,
@@ -51,6 +62,7 @@ from .const import (
     ENCRYPTED_MODELS,
     ENCRYPTED_SWITCHBOT_MODEL_TO_CLASS,
     NON_CONNECTABLE_SUPPORTED_MODEL_TYPES,
+    OAUTH_CLIENT_ID,
     SUPPORTED_MODEL_TYPES,
     SupportedModels,
 )
@@ -69,14 +81,120 @@ def short_address(address: str) -> str:
     return f"{results[-2].upper()}{results[-1].upper()}"[-4:]
 
 
+def _short_flow_id(flow_id: str) -> str:
+    """Return a short flow identifier for log correlation."""
+    return flow_id[-8:]
+
+
+def _masked_address(address: str) -> str:
+    """Mask a device address while retaining a useful suffix."""
+    return f"****{short_address(address)}"
+
+
 def name_from_discovery(discovery: SwitchBotAdvertisement) -> str:
     """Get the name from a discovery."""
     return f"{discovery.data['modelFriendlyName']} {short_address(discovery.address)}"
 
 
-class SwitchbotConfigFlow(ConfigFlow, domain=DOMAIN):
+def _oauth_request_info() -> RequestInfo:
+    """Return request metadata for HA OAuth exception adaptation."""
+    url = URL(OAUTH_TOKEN_URL)
+    return RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url)
+
+
+class SwitchbotOAuth2Implementation(config_entry_oauth2_flow.LocalOAuth2Implementation):
+    """SwitchBot OAuth implementation with its registered callback URI."""
+
+    @property
+    def redirect_uri(self) -> str:
+        """Return the callback URI registered for the public client."""
+        return MY_AUTH_CALLBACK_PATH
+
+    async def async_generate_authorize_url(self, flow_id: str) -> str:
+        """Generate an authorize URL using the provider implementation."""
+        _LOGGER.debug(
+            "Generating SwitchBot OAuth authorization URL; flow=%s "
+            "authorize_host=%s redirect_host=%s",
+            _short_flow_id(flow_id),
+            URL(OAUTH_AUTHORIZE_URL).host,
+            URL(self.redirect_uri).host,
+        )
+        ha_url = URL(await super().async_generate_authorize_url(flow_id))
+        return build_oauth_authorize_url(
+            self.client_id, self.redirect_uri, ha_url.query["state"]
+        )
+
+    async def async_resolve_external_data(
+        self, external_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve the callback through pySwitchbot's OAuth implementation."""
+        started = monotonic()
+        state_flow_id = external_data["state"].get("flow_id")
+        flow_id = (
+            _short_flow_id(state_flow_id)
+            if isinstance(state_flow_id, str)
+            else "unknown"
+        )
+        _LOGGER.debug(
+            "Resolving SwitchBot OAuth callback; flow=%s redirect_host=%s",
+            flow_id,
+            URL(external_data["state"]["redirect_uri"]).host,
+        )
+        try:
+            token = await exchange_oauth_code(
+                async_get_clientsession(self.hass),
+                self.client_id,
+                external_data["state"]["redirect_uri"],
+                external_data["code"],
+            )
+        except SwitchbotAuthenticationError as err:
+            _LOGGER.debug(
+                "SwitchBot OAuth code exchange was rejected; flow=%s duration_ms=%s",
+                flow_id,
+                round((monotonic() - started) * 1000),
+            )
+            raise OAuth2TokenRequestReauthError(
+                request_info=_oauth_request_info(),
+                status=401,
+                message=str(err),
+                domain=DOMAIN,
+            ) from err
+        except SwitchbotAccountConnectionError as err:
+            _LOGGER.debug(
+                "SwitchBot OAuth token service is temporarily unavailable; "
+                "flow=%s duration_ms=%s",
+                flow_id,
+                round((monotonic() - started) * 1000),
+            )
+            raise OAuth2TokenRequestTransientError(
+                request_info=_oauth_request_info(),
+                status=503,
+                message=str(err),
+                domain=DOMAIN,
+            ) from err
+        except SwitchbotApiError:
+            _LOGGER.debug(
+                "SwitchBot OAuth token response was invalid; flow=%s duration_ms=%s",
+                flow_id,
+                round((monotonic() - started) * 1000),
+            )
+            return {}
+        else:
+            _LOGGER.debug(
+                "SwitchBot OAuth token response fields: %s; flow=%s duration_ms=%s",
+                sorted(token),
+                flow_id,
+                round((monotonic() - started) * 1000),
+            )
+            return token
+
+
+class SwitchbotConfigFlow(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
     """Handle a config flow for Switchbot."""
 
+    DOMAIN = DOMAIN
     VERSION = 1
     MINOR_VERSION = 2
 
@@ -90,17 +208,205 @@ class SwitchbotConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         """Initialize the config flow."""
+        super().__init__()
         self._discovered_adv: SwitchBotAdvertisement | None = None
         self._discovered_advs: dict[str, SwitchBotAdvertisement] = {}
         self._cloud_username: str | None = None
         self._cloud_password: str | None = None
         self._encryption_method_selected = False
+        self._oauth_access_token: str | None = None
+        self._oauth_next_step: Literal["select_device", "encrypted_key"] | None = None
+
+    @property
+    def logger(self) -> logging.Logger:
+        """Return the logger."""
+        return _LOGGER
+
+    async def _async_start_oauth(
+        self, next_step: Literal["select_device", "encrypted_key"]
+    ) -> ConfigFlowResult:
+        """Start OAuth and remember where to continue after authorization."""
+        self._oauth_next_step = next_step
+        _LOGGER.debug(
+            "Starting SwitchBot OAuth flow; continuation=%s flow=%s source=%s "
+            "callback_host=%s",
+            next_step,
+            _short_flow_id(self.flow_id),
+            self.context.get("source", "unknown"),
+            URL(MY_AUTH_CALLBACK_PATH).host,
+        )
+        self.async_register_implementation(
+            self.hass,
+            SwitchbotOAuth2Implementation(
+                self.hass,
+                DOMAIN,
+                OAUTH_CLIENT_ID,
+                "",
+                OAUTH_AUTHORIZE_URL,
+                OAUTH_TOKEN_URL,
+            ),
+        )
+        return await self.async_step_pick_implementation()
+
+    async def async_step_oauth_login(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Start OAuth for cloud device discovery."""
+        return await self._async_start_oauth("select_device")
+
+    async def async_step_encrypted_oauth(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Use OAuth to retrieve an encrypted device key."""
+        if self._oauth_access_token is None:
+            return await self._async_start_oauth("encrypted_key")
+        return await self._async_retrieve_encryption_key_by_token()
+
+    async def async_oauth_create_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
+        """Continue device setup without persisting the OAuth token."""
+        access_token = data[CONF_TOKEN].get(CONF_ACCESS_TOKEN)
+        if not isinstance(access_token, str) or not access_token:
+            _LOGGER.debug(
+                "SwitchBot OAuth flow aborted; flow=%s reason=missing_access_token",
+                _short_flow_id(self.flow_id),
+            )
+            return self.async_abort(reason="oauth_error")
+
+        self._oauth_access_token = access_token
+        token = data[CONF_TOKEN]
+        _LOGGER.debug(
+            "SwitchBot OAuth token accepted; continuation=%s flow=%s expires_in=%s "
+            "refresh_token_present=%s refresh_expires_in_present=%s",
+            self._oauth_next_step,
+            _short_flow_id(self.flow_id),
+            token.get("expires_in"),
+            bool(token.get("refresh_token")),
+            "refresh_expires_in" in token,
+        )
+        if self._oauth_next_step == "select_device":
+            started = monotonic()
+            try:
+                _LOGGER.debug(
+                    "Loading SwitchBot cloud device metadata with OAuth; flow=%s",
+                    _short_flow_id(self.flow_id),
+                )
+                await fetch_cloud_devices_by_token(
+                    async_get_clientsession(self.hass), access_token
+                )
+                _LOGGER.debug(
+                    "SwitchBot cloud device metadata loaded successfully; "
+                    "flow=%s duration_ms=%s",
+                    _short_flow_id(self.flow_id),
+                    round((monotonic() - started) * 1000),
+                )
+            except SwitchbotAuthenticationError as ex:
+                _LOGGER.debug(
+                    "OAuth token authentication failed; flow=%s duration_ms=%s: %s",
+                    _short_flow_id(self.flow_id),
+                    round((monotonic() - started) * 1000),
+                    ex,
+                    exc_info=True,
+                )
+                return self.async_abort(reason="oauth_unauthorized")
+            except (SwitchbotApiError, SwitchbotAccountConnectionError) as ex:
+                _LOGGER.debug(
+                    "Failed to connect to SwitchBot API; flow=%s duration_ms=%s: %s",
+                    _short_flow_id(self.flow_id),
+                    round((monotonic() - started) * 1000),
+                    ex,
+                    exc_info=True,
+                )
+                return self.async_abort(
+                    reason="api_error",
+                    description_placeholders={"error_detail": str(ex)},
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "Unexpected error during OAuth cloud login; flow=%s duration_ms=%s",
+                    _short_flow_id(self.flow_id),
+                    round((monotonic() - started) * 1000),
+                )
+                return self.async_abort(reason="unknown")
+            return await self.async_step_select_device()
+
+        if self._oauth_next_step == "encrypted_key":
+            return await self._async_retrieve_encryption_key_by_token()
+
+        _LOGGER.debug(
+            "SwitchBot OAuth flow aborted; flow=%s reason=missing_continuation",
+            _short_flow_id(self.flow_id),
+        )
+        return self.async_abort(reason="oauth_error")
+
+    async def _async_retrieve_encryption_key_by_token(self) -> ConfigFlowResult:
+        """Retrieve an encryption key with the current flow's OAuth token."""
+        assert self._discovered_adv is not None
+        assert self._oauth_access_token is not None
+        model: SwitchbotModel = self._discovered_adv.data["modelName"]
+        cls = ENCRYPTED_SWITCHBOT_MODEL_TO_CLASS[model]
+        masked_address = _masked_address(self._discovered_adv.address)
+        started = monotonic()
+        _LOGGER.debug(
+            "Retrieving SwitchBot encryption key with OAuth; flow=%s model=%s "
+            "device=%s",
+            _short_flow_id(self.flow_id),
+            model,
+            masked_address,
+        )
+        try:
+            key_details = await cls.async_retrieve_encryption_key_by_token(
+                async_get_clientsession(self.hass),
+                self._discovered_adv.address,
+                self._oauth_access_token,
+            )
+            _LOGGER.debug(
+                "SwitchBot OAuth encryption key retrieval succeeded; "
+                "flow=%s device=%s duration_ms=%s",
+                _short_flow_id(self.flow_id),
+                masked_address,
+                round((monotonic() - started) * 1000),
+            )
+        except SwitchbotAuthenticationError as ex:
+            _LOGGER.debug(
+                "OAuth token authentication failed; flow=%s device=%s "
+                "duration_ms=%s: %s",
+                _short_flow_id(self.flow_id),
+                masked_address,
+                round((monotonic() - started) * 1000),
+                ex,
+                exc_info=True,
+            )
+            return self.async_abort(reason="oauth_unauthorized")
+        except (SwitchbotApiError, SwitchbotAccountConnectionError) as ex:
+            _LOGGER.debug(
+                "Failed to connect to SwitchBot API; flow=%s device=%s "
+                "duration_ms=%s: %s",
+                _short_flow_id(self.flow_id),
+                masked_address,
+                round((monotonic() - started) * 1000),
+                ex,
+                exc_info=True,
+            )
+            return self.async_abort(
+                reason="api_error",
+                description_placeholders={"error_detail": str(ex)},
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected error retrieving encryption key with OAuth; "
+                "flow=%s device=%s duration_ms=%s",
+                _short_flow_id(self.flow_id),
+                masked_address,
+                round((monotonic() - started) * 1000),
+            )
+            return self.async_abort(reason="unknown")
+        return await self.async_step_encrypted_key(key_details)
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
         """Handle the bluetooth discovery step."""
-        _LOGGER.debug("Discovered bluetooth device: %s", discovery_info.as_dict())
+        # _LOGGER.debug("Discovered bluetooth device: %s", discovery_info.as_dict())
         await self.async_set_unique_id(format_unique_id(discovery_info.address))
         self._abort_if_unique_id_configured()
         parsed = parse_advertisement_data(
@@ -141,6 +447,15 @@ class SwitchbotConfigFlow(ConfigFlow, domain=DOMAIN):
         options: dict[str, Any] = {CONF_RETRY_COUNT: DEFAULT_RETRY_COUNT}
         if sensor_type == SupportedModels.CURTAIN:
             options[CONF_CURTAIN_SPEED] = DEFAULT_CURTAIN_SPEED
+
+        _LOGGER.debug(
+            "Creating SwitchBot device entry; flow=%s model=%s device=%s "
+            "oauth_used=%s oauth_token_stored=False",
+            _short_flow_id(self.flow_id),
+            model_name,
+            _masked_address(discovery.address),
+            self._oauth_access_token is not None,
+        )
 
         return self.async_create_entry(
             title=name,
@@ -267,7 +582,7 @@ class SwitchbotConfigFlow(ConfigFlow, domain=DOMAIN):
         self._encryption_method_selected = True
         return self.async_show_menu(
             step_id="encrypted_choose_method",
-            menu_options=["encrypted_auth", "encrypted_key"],
+            menu_options=["encrypted_oauth", "encrypted_auth", "encrypted_key"],
             description_placeholders={
                 "name": name_from_discovery(self._discovered_adv),
             },
@@ -355,7 +670,7 @@ class SwitchbotConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle the user step to choose cloud login or direct discovery."""
         return self.async_show_menu(
             step_id="user",
-            menu_options=["cloud_login", "select_device"],
+            menu_options=["oauth_login", "cloud_login", "select_device"],
         )
 
     async def async_step_cloud_login(
